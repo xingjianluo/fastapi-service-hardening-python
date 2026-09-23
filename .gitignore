@@ -7,3 +7,10 @@ __pycache__/
 dist/
 build/
 *.egg-info/
+
+# runtime artifacts
+.state/
+logs/
+*.db
+*.db-wal
+*.db-shm

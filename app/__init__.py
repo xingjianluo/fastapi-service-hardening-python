@@ -1,0 +1,1 @@
+"""Hardened FastAPI service package."""

@@ -1,8 +1,10 @@
-from fastapi import FastAPI
+"""Backward-compatible entrypoint.
 
-app = FastAPI()
+The hardened implementation lives in the ``app`` package; this module
+simply re-exports the ASGI application so ``uvicorn main:app`` (and any
+pre-existing import of ``main.app``) keeps working.
+"""
 
+from app.main import app
 
-@app.get("/")
-def read_root():
-    return {"Hello": "World"}
+__all__ = ["app"]

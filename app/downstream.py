@@ -1,16 +1,15 @@
-"""Downstream HTTP calls with timeout and bounded-concurrency isolation.
+"""Downstream HTTP calls with a hard per-call timeout.
 
-Two protections keep a slow downstream from collapsing the service:
+The timeout is applied per call (``asyncio.timeout`` on top of the httpx
+client's own, slightly larger, budget), so different downstream targets can
+carry different deadlines. A slow call returns ``CallStatus.TIMEOUT`` (mapped
+to HTTP 504) instead of hanging or being silently swallowed.
 
-* **Timeout** -- every call carries an explicit ``asyncio`` deadline on top of
-  the client's own timeouts. A slow call is returned as ``CallStatus.TIMEOUT``
-  (mapped to HTTP 504) instead of hanging or being silently swallowed.
-* **Bulkhead** -- an ``asyncio.Semaphore`` caps the number of in-flight calls.
-  Once saturated, further requests fail fast with ``CallStatus.REJECTED``
-  (mapped to HTTP 503) rather than queueing without bound, so connections,
-  memory and event-loop capacity stay bounded. The semaphore is released in a
-  ``finally`` block (including on timeout/cancellation) and ``httpx`` closes
-  the response, so resources are recycled for subsequent requests.
+Concurrency isolation itself lives in :mod:`app.bulkhead` (cross-process
+global + per-target permits); this module only owns the HTTP exchange. The
+httpx pool is bounded by the global in-flight limit so a slow dependency
+cannot exhaust sockets, and responses are explicitly closed so connections
+are recycled for subsequent requests.
 """
 
 from __future__ import annotations
@@ -25,7 +24,7 @@ import httpx
 class CallStatus(str, Enum):
     OK = "ok"
     TIMEOUT = "timeout"
-    REJECTED = "rejected"
+    REJECTED = "rejected"  # kept for taxonomy compatibility
     ERROR = "error"
 
 
@@ -41,22 +40,13 @@ class DownstreamClient:
     def __init__(self, timeout_sec: float, max_inflight: int) -> None:
         self._timeout_sec = float(timeout_sec)
         self._max_inflight = int(max_inflight)
-        self._semaphore = asyncio.Semaphore(self._max_inflight)
-        # Makes the "is the bulkhead full?" check and permit acquisition
-        # atomic, eliminating a check-then-acquire race under concurrency.
-        self._admission_lock = asyncio.Lock()
         # Bounded pool: at most max_inflight connections in use so a slow
         # dependency cannot exhaust sockets/worker threads.
         limits = httpx.Limits(
             max_connections=self._max_inflight,
             max_keepalive_connections=self._max_inflight,
         )
-        self._client = httpx.AsyncClient(
-            # Give httpx a slightly larger budget so the asyncio deadline below
-            # is the single, authoritative source of timeout classification.
-            timeout=httpx.Timeout(self._timeout_sec + 0.25),
-            limits=limits,
-        )
+        self._client = httpx.AsyncClient(limits=limits)
         self._closed = False
 
     @property
@@ -68,19 +58,15 @@ class DownstreamClient:
             self._closed = True
             await self._client.aclose()
 
-    async def call(self, url: str) -> CallResult:
-        # Atomically decide admit vs. fail-fast. Because the check and acquire
-        # are uninterrupted, exactly max_inflight calls are ever in flight.
-        async with self._admission_lock:
-            if self._semaphore.locked():
-                return CallResult(
-                    status=CallStatus.REJECTED,
-                    detail="downstream bulkhead saturated",
-                )
-            await self._semaphore.acquire()
+    async def call(self, url: str, timeout_sec: float | None = None) -> CallResult:
+        deadline = self._timeout_sec if timeout_sec is None else float(timeout_sec)
         try:
-            async with asyncio.timeout(self._timeout_sec):
-                response = await self._client.get(url)
+            async with asyncio.timeout(deadline):
+                # Give httpx a slightly larger budget so the asyncio deadline
+                # is the single, authoritative source of timeout classification.
+                response = await self._client.get(
+                    url, timeout=httpx.Timeout(deadline + 0.25)
+                )
                 try:
                     payload: dict | None = None
                     try:
@@ -105,12 +91,10 @@ class DownstreamClient:
         except TimeoutError:
             return CallResult(
                 status=CallStatus.TIMEOUT,
-                detail=f"downstream call exceeded {self._timeout_sec}s",
+                detail=f"downstream call exceeded {deadline}s",
             )
         except asyncio.CancelledError:
-            # Never strand a bulkhead permit on cancellation.
+            # Propagate cancellation; the caller's ``finally`` releases permits.
             raise
         except httpx.HTTPError as exc:
             return CallResult(status=CallStatus.ERROR, detail=str(exc))
-        finally:
-            self._semaphore.release()

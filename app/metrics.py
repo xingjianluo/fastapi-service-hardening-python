@@ -34,6 +34,7 @@ OUTCOMES: tuple[str, ...] = (
     "timeout",
     "rate_limited",
     "bulkhead_rejected",
+    "target_rejected",
     "internal_error",
 )
 
@@ -97,6 +98,8 @@ class MetricsRecorder:
         self._hists: dict[str, list[int]] = defaultdict(
             lambda: [0] * _N_BUCKETS
         )
+        # Per-target aggregates: (target, outcome) -> [count, sum, min, max].
+        self._target_stats: dict[tuple[str, str], list[float]] = {}
         self._lock = threading.Lock()
         self._db_lock = threading.Lock()
         self._conn: sqlite3.Connection | None = None
@@ -105,7 +108,9 @@ class MetricsRecorder:
 
     # -- in-process recording ------------------------------------------------
 
-    def observe(self, outcome: str, latency_sec: float) -> None:
+    def observe(
+        self, outcome: str, latency_sec: float, target: str | None = None
+    ) -> None:
         with self._lock:
             self._counts[outcome] += 1
             self._sums[outcome] += latency_sec
@@ -119,6 +124,17 @@ class MetricsRecorder:
                 latency_sec if cur_max is None else max(cur_max, latency_sec)
             )
             self._hists[outcome][bucket_index(latency_sec)] += 1
+            if target is not None:
+                key = (target, outcome)
+                stats = self._target_stats.get(key)
+                if stats is None:
+                    # [count, sum, min, max]
+                    self._target_stats[key] = [1, latency_sec, latency_sec, latency_sec]
+                else:
+                    stats[0] += 1
+                    stats[1] += latency_sec
+                    stats[2] = min(stats[2], latency_sec)
+                    stats[3] = max(stats[3], latency_sec)
 
     # -- cross-process flush -------------------------------------------------
 
@@ -148,13 +164,19 @@ class MetricsRecorder:
                 for idx, count in enumerate(hist):
                     if count:
                         hist_rows.append((outcome, idx, count))
+            target_rows = [
+                (target, outcome, int(stats[0]), stats[1], stats[2], stats[3])
+                for (target, outcome), stats in self._target_stats.items()
+                if stats[0] > 0
+            ]
             self._counts.clear()
             self._sums.clear()
             self._sumsq.clear()
             self._mins.clear()
             self._maxs.clear()
             self._hists.clear()
-        if not metric_rows:
+            self._target_stats.clear()
+        if not metric_rows and not target_rows:
             return
         # Serialize all transactions/reads on this connection: the periodic
         # flush thread and request threads serving /metrics otherwise overlap.
@@ -185,6 +207,19 @@ class MetricsRecorder:
                             count = count + excluded.count
                         """,
                         hist_rows,
+                    )
+                    conn.executemany(
+                        """
+                        INSERT INTO metrics_target(target, outcome, count,
+                                                   latency_sum, latency_min, latency_max)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(target, outcome) DO UPDATE SET
+                            count = count + excluded.count,
+                            latency_sum = latency_sum + excluded.latency_sum,
+                            latency_min = MIN(latency_min, excluded.latency_min),
+                            latency_max = MAX(latency_max, excluded.latency_max)
+                        """,
+                        target_rows,
                     )
                     conn.execute("COMMIT")
                     return
@@ -244,6 +279,10 @@ class MetricsRecorder:
             ):
                 if outcome in hists:
                     hists[outcome][idx] += int(count)
+            target_rows = conn.execute(
+                "SELECT target, outcome, count, latency_sum, latency_min, "
+                "latency_max FROM metrics_target"
+            ).fetchall()
 
         result: dict[str, dict] = {}
         total = 0
@@ -267,4 +306,18 @@ class MetricsRecorder:
             }
             total += count
         result["total"] = total
+
+        # Per-target breakdown (only targets with observations appear).
+        targets: dict[str, dict] = {}
+        for target, outcome, count, lsum, lmin, lmax in target_rows:
+            count = int(count)
+            if count <= 0:
+                continue
+            targets.setdefault(target, {})[outcome] = {
+                "count": count,
+                "latency_mean_sec": lsum / count,
+                "latency_min_sec": lmin,
+                "latency_max_sec": lmax,
+            }
+        result["targets"] = targets
         return result

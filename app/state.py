@@ -45,6 +45,33 @@ CREATE TABLE IF NOT EXISTS metrics_hist (
 )
 """
 
+# Cross-process in-flight bulkhead permits. One row per held permit, keyed by
+# scope ("global" or "target:<host:port>") plus a unique owner id. Each row
+# carries a lease expiry so permits leaked by a crashed worker are reclaimed
+# lazily instead of stranding capacity forever.
+_SCHEMA_INFLIGHT = """
+CREATE TABLE IF NOT EXISTS inflight_permits (
+    scope      TEXT NOT NULL,
+    owner      TEXT NOT NULL,
+    expires_at REAL NOT NULL,
+    PRIMARY KEY (scope, owner)
+)
+"""
+
+# Per-target outcome/latency aggregates (same additive-delta scheme as
+# ``metrics`` but with a target dimension).
+_SCHEMA_METRICS_TARGET = """
+CREATE TABLE IF NOT EXISTS metrics_target (
+    target      TEXT NOT NULL,
+    outcome     TEXT NOT NULL,
+    count       INTEGER NOT NULL,
+    latency_sum REAL NOT NULL,
+    latency_min REAL NOT NULL,
+    latency_max REAL NOT NULL,
+    PRIMARY KEY (target, outcome)
+)
+"""
+
 
 def open_db(db_path: str) -> sqlite3.Connection:
     """Open (creating schema/directories as needed) a shared SQLite connection."""
@@ -60,6 +87,8 @@ def open_db(db_path: str) -> sqlite3.Connection:
     conn.execute(_SCHEMA_TOKENS)
     conn.execute(_SCHEMA_METRICS)
     conn.execute(_SCHEMA_METRICS_HIST)
+    conn.execute(_SCHEMA_INFLIGHT)
+    conn.execute(_SCHEMA_METRICS_TARGET)
     return conn
 
 

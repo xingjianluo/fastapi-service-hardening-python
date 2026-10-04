@@ -7,12 +7,13 @@
 
 ```
 main.py                # 仅暴露 app = create_app()
-app/config.py          # 全部可调参数（环境变量覆盖）
+app/config.py          # 全部可调参数（环境变量覆盖，含按目标覆盖项）
 app/state.py           # 共享 SQLite（WAL）连接与表结构
 app/rate_limit.py      # 跨进程令牌桶（BEGIN IMMEDIATE 串行化）
-app/downstream.py     # 超时 + 并发舱壁（Semaphore + httpx 连接池）
-app/metrics.py         # 结果分类计数、时延统计与对数分桶 p50/p90/p99
-app/outcomes.py        # 五类结果枚举
+app/bulkhead.py        # 跨进程两级舱壁：全局总闸 + 按下游目标隔离（租约许可）
+app/downstream.py      # 带逐调用硬超时的下游 HTTP 调用（httpx 连接池）
+app/metrics.py         # 结果分类计数、时延统计、对数分桶 p50/p90/p99、按目标拆分
+app/outcomes.py        # 六类结果枚举
 app/http_app.py        # 装配、端点、失败语义与埋点
 tests/                 # 真实 uvicorn 子进程 + 并发洪泛 + 报告
 ```
@@ -51,15 +52,31 @@ uv run uvicorn main:app \
 
 ## 二、超时与隔离语义（Timeout & Bulkhead）
 
-对下游调用同时施加两道保护：
+对下游调用施加**两级舱壁 + 逐目标硬超时**：
 
-1. **硬超时**：每个调用包裹 `asyncio.timeout(timeout)`，叠加 httpx 自身超时。
-   超时不会挂起、也不会被静默吞掉，而是转成 **`504 downstream_timeout`**，
-   时延被钉死在超时阈值附近（而非依赖的真实耗时）。
-2. **并发舱壁**：`asyncio.Semaphore(max_inflight)` 限制在途调用数，httpx 连接池
-   同样以该值封顶。舱壁满时请求**快速失败**为 **`503 bulkhead_rejected`**，不做
-   无界排队；许可在 `finally`（含超时/取消）中释放，响应显式关闭，连接归还连接池，
-   因此后续波次行为与首轮完全一致。
+1. **目标级舱壁**：每个下游目标（以 URL 的 `host:port` 为身份）有独立的在途上限
+   `max_inflight`。慢目标只能占用自己的份额，份额用完后对该目标的请求**快速失败**为
+   **`503 target_rejected`**，不会排队、更不会挤占其它目标的容量——健康目标的成功率和
+   时延不受影响。
+2. **全局总闸**：所有目标共享全局在途上限 `DOWNSTREAM_MAX_INFLIGHT`，作为最终断路器。
+   全局闸门耗尽时拒绝为 **`503 bulkhead_rejected`**（与目标级拒绝可区分）。
+3. **逐目标硬超时**：每个目标有独立的 `timeout_sec`，调用包裹 `asyncio.timeout`，
+   超时转成 **`504 downstream_timeout`**，时延被钉死在该目标的超时阈值附近。
+
+**跨进程一致性**：许可不是进程内信号量，而是共享 SQLite 中的 `inflight_permits` 行
+（scope = `global` 或 `target:<host:port>`）。获取在单个 `BEGIN IMMEDIATE` 事务内完成
+「清理过期租约 → 计数 → 插入」，因此多 worker 下目标级与全局在途数都**绝不超额**，
+也不存在按实例切分额度导致的「个别实例耗尽整体」问题。每个许可带租约
+（`timeout_sec + 10s`）：正常路径在 `finally`（含超时/取消/异常）中立即释放；持有者
+进程崩溃时，租约到期后被惰性回收，容量不会永久泄漏。连续多轮压力下各波次分布一致。
+
+**目标配置语义**（运行时环境变量即可调整）：
+
+* 未配置任何目标规则时，目标级默认值回退到全局值，行为与上一版完全一致（兼容）。
+* `TARGET_DEFAULT_MAX_INFLIGHT` / `TARGET_DEFAULT_TIMEOUT_SEC`：所有未显式覆盖的
+  目标共用的默认容量/超时。
+* `TARGET_OVERRIDES`：JSON 对象，按 `host:port` 覆盖，字段可只给其一，例如
+  `TARGET_OVERRIDES='{"127.0.0.1:9001": {"max_inflight": 4, "timeout_sec": 0.5}}'`。
 
 失败都是**明确、可区分、可观测**的结果，而不是挂起或静默降级：
 
@@ -67,10 +84,14 @@ uv run uvicorn main:app \
 | --- | --- | --- |
 | 200 | `success` | 下游 2xx |
 | 429 | `rate_limited` | 超出准入容量（未调用下游） |
-| 503 | `bulkhead_rejected` | 在途下游调用已满 |
-| 504 | `timeout` | 下游超过截止时间 |
+| 503 | `bulkhead_rejected` | **全局**在途闸门已满（所有目标共享的总闸） |
+| 503 | `target_rejected` | **该目标自身**容量份额耗尽（不影响其它目标） |
+| 504 | `timeout` | 下游超过该目标的截止时间 |
 | 502 | `internal_error` | 下游连接错误 / 非 2xx |
 | 500 | `internal_error` | 服务端未预期异常 |
+
+两类 503 通过响应体的 `error`（`bulkhead_rejected` vs `target_bulkhead_rejected`）
+与 `outcome` 字段区分；每个 `/data` 响应还带 `target` 字段标明归属的下游目标。
 
 ## 三、指标含义（Observability）
 
@@ -85,7 +106,10 @@ uv run uvicorn main:app \
 * `latency_p50_sec` / `latency_p90_sec` / `latency_p99_sec`：由**对数等宽直方图**
   （1ms~60s，桶在各进程间可相加）估计，无需逐请求存行。
 
-**冷启动/预热语义一致**：计数从 0 开始；任何时刻快照都包含全部五个 outcome 且字段
+另有顶层 `targets` 字段，按下游目标（`host:port`）拆分每个目标的 outcome 计数与
+`latency_mean/min/max`，可直接看出每个目标的并发规模、时延分布与拒绝计数。
+
+**冷启动/预热语义一致**：计数从 0 开始；任何时刻快照都包含全部六个 outcome 且字段
 齐全（无观测时为 0），拒绝/超时与成功走同一条埋点路径，因此冷启动与稳态的数据形状
 完全相同。
 
@@ -113,6 +137,32 @@ uv run uvicorn main:app --workers 2 --port 8000
 # 24 个并发请求 → 恰好 12 个 200、12 个 429
 ```
 
+目标级隔离手动复现。目标身份是 URL 的 `host:port`，因此同一台服务器的
+`localhost:8000` 与 `127.0.0.1:8000` 就是**两个目标**：把 `localhost` 当慢目标
+（容量 2、超时 0.5s），`127.0.0.1` 当健康目标（用默认容量）：
+
+```bash
+TARGET_OVERRIDES='{"localhost:8000": {"max_inflight": 2, "timeout_sec": 0.5}}' \
+DOWNSTREAM_MAX_INFLIGHT=20 RATE_LIMIT_CAPACITY=100000 RATE_LIMIT_REFILL_PER_SEC=100000 \
+uv run uvicorn main:app --port 8000 &
+
+# 慢目标（delay=2s > 0.5s 超时）并发 8 个，压在后台
+seq 8 | xargs -P8 -I{} curl -s -o /dev/null -w 'slow %{http_code}\n' \
+  'localhost:8000/data?target=http%3A%2F%2Flocalhost%3A8000%2Finternal%2Fdownstream%3Fdelay%3D2' | sort | uniq -c &
+sleep 0.2
+# 同时打健康目标：全部 200，不被慢目标拖累
+seq 8 | xargs -P8 -I{} curl -s -o /dev/null -w 'fast %{http_code}\n' \
+  'localhost:8000/data?target=http%3A%2F%2F127.0.0.1%3A8000%2Finternal%2Fdownstream%3Fdelay%3D0.02' | sort | uniq -c
+wait
+# 输出：fast 8×200；slow 2×504（占满 2 个许可后超时）+ 6×503 target_rejected
+
+# 每个目标的并发结果、时延分布与拒绝计数
+curl -s localhost:8000/metrics | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)["targets"], indent=2))'
+```
+
+注意：`TARGET_OVERRIDES` 的键必须与 `target` URL 的 authority **逐字符一致**
+（`localhost:8000` 与 `127.0.0.1:8000` 是两个不同目标）。
+
 ### 自动化测试
 
 ```bash
@@ -127,8 +177,15 @@ uv run pytest -s            # -s 查看每次洪泛打印的并发规模/时延�
   **端到端吞吐提升 ≥ 3×**（实测约 6×），重复波次分布一致以证明资源被回收。
 * **限流** `test_rate_limit.py`：突发精确接纳/拒绝、持续低速零误伤、令牌恢复、
   以及 **2 worker 共享桶不超发**。
-* **观测** `test_metrics_and_observability.py`：冷启动零值形状稳定、五种 outcome
+* **观测** `test_metrics_and_observability.py`：冷启动零值形状稳定、六种 outcome
   可区分、p50/p90/p99 时延统计、跨进程计数聚合。
+* **目标级隔离** `test_target_isolation.py`：两个独立下游目标（两个依赖子进程，
+  一慢 2s 一快 20ms）并发施压。验证慢目标只占自己的 4 个许可（4×504 + 28×
+  `target_rejected`），快目标 32/32 全部成功且 p99 远低于慢目标超时；目标级拒绝与
+  超时/下游错误/连接失败/内部异常逐一可区分；连续 3 波分布无漂移（许可回收）；
+  2 worker 下目标级与全局限额共同精确生效；`/metrics` 的 `targets` 拆分与之一致。
+* **舱壁单元** `test_bulkhead_unit.py`：目标身份解析、覆盖项优先级、目标间隔离、
+  全局总闸、许可回收复用、并发不超发、崩溃持有者租约到期回收。
 
 每个洪泛用例都会打印，例如：
 
@@ -145,7 +202,21 @@ uv run pytest -s            # -s 查看每次洪泛打印的并发规模/时延�
 | --- | --- | --- |
 | `RATE_LIMIT_CAPACITY` | 20 | 令牌桶容量（最大突发） |
 | `RATE_LIMIT_REFILL_PER_SEC` | 10 | 每秒补充令牌数（持续速率） |
-| `DOWNSTREAM_TIMEOUT_SEC` | 1.0 | 下游调用硬超时（秒） |
-| `DOWNSTREAM_MAX_INFLIGHT` | 20 | 在途下游调用上限（舱壁/连接池） |
+| `DOWNSTREAM_TIMEOUT_SEC` | 1.0 | 下游调用硬超时（秒），兼作目标级默认超时 |
+| `DOWNSTREAM_MAX_INFLIGHT` | 20 | 全局在途下游调用上限（跨进程总闸/连接池） |
+| `TARGET_DEFAULT_MAX_INFLIGHT` | 同全局值 | 未覆盖目标的默认在途上限 |
+| `TARGET_DEFAULT_TIMEOUT_SEC` | 同全局值 | 未覆盖目标的默认超时（秒） |
+| `TARGET_OVERRIDES` | 空 | JSON：`{"host:port": {"max_inflight": N, "timeout_sec": S}}` |
 | `SERVICE_DB_PATH` | `.state/service.db` | 跨进程共享 SQLite 路径 |
 | `METRICS_FLUSH_INTERVAL_SEC` | 1.0 | 指标增量落库周期（秒） |
+
+## 六、多进程边界与兼容范围
+
+* **一致语义**：限流令牌桶、目标级/全局在途许可、失败计数全部落在共享 SQLite，
+  请求落到哪个 worker 都不改变判定结果；全局上限始终是最终总闸。
+* **租约边界**：许可租约为 `目标超时 + 10s`。worker 崩溃后其许可最多占用一个租约
+  周期即被回收；这是崩溃恢复的唯一时间边界，正常路径不受影响。
+* **兼容范围**：`GET /` 与成功响应结构不变；原有五类 outcome、状态码与跨进程聚合
+  行为保持；新增 `target_rejected` outcome、`targets` 指标拆分与响应中的 `target`
+  字段均为纯增量。未配置任何 `TARGET_*` 变量时，目标级默认值回退到全局值，行为与
+  上一版逐项一致（既有测试全部原样通过）。

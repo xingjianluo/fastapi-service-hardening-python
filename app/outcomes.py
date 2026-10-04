@@ -9,5 +9,6 @@ class Outcome(str, Enum):
     SUCCESS = "success"
     TIMEOUT = "timeout"
     RATE_LIMITED = "rate_limited"
-    BULKHEAD_REJECTED = "bulkhead_rejected"
+    BULKHEAD_REJECTED = "bulkhead_rejected"  # global in-flight gate saturated
+    TARGET_REJECTED = "target_rejected"  # one target's own share exhausted
     INTERNAL_ERROR = "internal_error"

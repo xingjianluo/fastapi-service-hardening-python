@@ -11,9 +11,12 @@ class Settings:
     # Token-bucket admission control shared across worker processes.
     rate_limit_capacity: float
     rate_limit_refill_per_sec: float
-    # Downstream isolation: per-request timeout and max concurrent in-flight calls.
+    # Downstream isolation: per-request timeout and max concurrent in-flight
+    # calls (defaults; also the GLOBAL cross-target capacity gate).
     downstream_timeout_sec: float
     downstream_max_inflight: int
+    # Per-target overrides as JSON: [{"name","match","max_inflight","timeout_sec"}]
+    downstream_targets_json: str
     # SQLite file used for cross-process rate limiting and metrics aggregation.
     db_path: str
     # How often in-process metrics counters are flushed to the shared DB.
@@ -36,6 +39,7 @@ def get_settings() -> Settings:
         rate_limit_refill_per_sec=_float_env("RATE_LIMIT_REFILL_PER_SEC", 10.0),
         downstream_timeout_sec=_float_env("DOWNSTREAM_TIMEOUT_SEC", 1.0),
         downstream_max_inflight=_int_env("DOWNSTREAM_MAX_INFLIGHT", 20),
+        downstream_targets_json=os.environ.get("DOWNSTREAM_TARGETS_JSON", ""),
         db_path=os.environ.get("SERVICE_DB_PATH", ".state/service.db"),
         metrics_flush_interval_sec=_float_env("METRICS_FLUSH_INTERVAL_SEC", 1.0),
     )

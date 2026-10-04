@@ -14,11 +14,13 @@ Endpoints
 Failure semantics (distinct and machine-readable)
 -------------------------------------------------
 * 200 success
-* 429 ``rate_limited``       -- rejected by the cross-process token bucket
-* 503 ``bulkhead_rejected``  -- too many in-flight downstream calls
-* 504 ``downstream_timeout`` -- downstream did not respond within the deadline
-* 502 ``downstream_error``   -- downstream connection/HTTP failure
-* 500 ``internal_error``     -- unexpected server-side error
+* 429 ``rate_limited``              -- rejected by the cross-process token bucket
+* 503 ``bulkhead_rejected``         -- global in-flight budget exhausted
+* 503 ``target_bulkhead_rejected``  -- this target's own capacity exhausted
+* 504 ``downstream_timeout``        -- downstream did not respond within the deadline
+* 502 ``downstream_error``          -- downstream answered with an error status
+* 502 ``downstream_connect_error``  -- network/connection failure
+* 500 ``internal_error``            -- unexpected server-side error
 """
 
 from __future__ import annotations
@@ -35,6 +37,7 @@ from .metrics import MetricsRecorder
 from .outcomes import Outcome
 from .rate_limit import RateLimiter
 from .state import init_state
+from .targets import parse_targets
 
 
 @asynccontextmanager
@@ -51,7 +54,10 @@ async def lifespan(app: FastAPI):
     )
     app.state.metrics.start()
     app.state.downstream = DownstreamClient(
-        settings.downstream_timeout_sec, settings.downstream_max_inflight
+        settings.db_path,
+        settings.downstream_timeout_sec,
+        settings.downstream_max_inflight,
+        parse_targets(settings.downstream_targets_json),
     )
     try:
         yield
@@ -137,18 +143,46 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         result = await client.call(target)
 
         if result.status == CallStatus.OK:
-            return finish(Outcome.SUCCESS, 200, {"data": result.payload})
+            return finish(
+                Outcome.SUCCESS,
+                200,
+                {"data": result.payload, "target": result.target},
+            )
         if result.status == CallStatus.TIMEOUT:
             return finish(
                 Outcome.TIMEOUT,
                 504,
-                {"error": "downstream_timeout", "detail": result.detail},
+                {
+                    "error": "downstream_timeout",
+                    "target": result.target,
+                    "detail": result.detail,
+                },
             )
         if result.status == CallStatus.REJECTED:
             return finish(
                 Outcome.BULKHEAD_REJECTED,
                 503,
-                {"error": "bulkhead_rejected", "detail": result.detail},
+                {
+                    "error": "bulkhead_rejected",
+                    "target": result.target,
+                    "detail": result.detail,
+                },
+            )
+        if result.status == CallStatus.TARGET_REJECTED:
+            return finish(
+                Outcome.TARGET_BULKHEAD_REJECTED,
+                503,
+                {
+                    "error": "target_bulkhead_rejected",
+                    "target": result.target,
+                    "detail": result.detail,
+                },
+            )
+        if result.status == CallStatus.CONNECT_ERROR:
+            return finish(
+                Outcome.INTERNAL_ERROR,
+                502,
+                {"error": "downstream_connect_error", "detail": result.detail},
             )
         return finish(
             Outcome.INTERNAL_ERROR,
@@ -163,6 +197,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/metrics")
     async def metrics(request: Request):
         return request.app.state.metrics.snapshot()
+
+    @app.get("/internal/bulkheads")
+    async def bulkheads(request: Request):
+        """Live in-flight permits per scope (global + per target)."""
+        client: DownstreamClient = request.app.state.downstream
+        return client.in_flight_snapshot()
 
     @app.exception_handler(Exception)
     async def unhandled_exception_handler(request: Request, exc: Exception):

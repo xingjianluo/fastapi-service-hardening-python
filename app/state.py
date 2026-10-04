@@ -46,6 +46,23 @@ CREATE TABLE IF NOT EXISTS metrics_hist (
 """
 
 
+# In-flight permits (global + per-target capacity), one row per held permit.
+# Rows carry a TTL so a crashed worker's permits expire instead of leaking.
+_SCHEMA_PERMITS = """
+CREATE TABLE IF NOT EXISTS inflight_permit (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    scope      TEXT NOT NULL,
+    owner      TEXT NOT NULL,
+    expires_at REAL NOT NULL
+)
+"""
+
+_SCHEMA_PERMITS_IDX = """
+CREATE INDEX IF NOT EXISTS idx_inflight_permit_scope
+ON inflight_permit(scope)
+"""
+
+
 def open_db(db_path: str) -> sqlite3.Connection:
     """Open (creating schema/directories as needed) a shared SQLite connection."""
     directory = os.path.dirname(os.path.abspath(db_path))
@@ -60,6 +77,8 @@ def open_db(db_path: str) -> sqlite3.Connection:
     conn.execute(_SCHEMA_TOKENS)
     conn.execute(_SCHEMA_METRICS)
     conn.execute(_SCHEMA_METRICS_HIST)
+    conn.execute(_SCHEMA_PERMITS)
+    conn.execute(_SCHEMA_PERMITS_IDX)
     return conn
 
 

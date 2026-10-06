@@ -21,11 +21,15 @@ explicitly in a ``finally`` (success, timeout, error *and* cancellation); a
 worker that dies anyway has its permits reclaimed lazily once the lease
 expires, so capacity cannot be stranded permanently.
 
-Target identity: the ``host:port`` authority of the downstream URL. Limits and
-timeouts resolve from ``Settings.target_overrides`` with
-``target_default_*`` (which themselves default to the global values) as
-fallback -- so without any target configuration, behavior is exactly the
-previous single global bulkhead.
+Target identity: the **logical endpoint** ``scheme://host:port/path`` of the
+downstream URL. Two deployments sharing a domain/port but exposed at different
+paths are *different targets* with independent capacity and deadlines; the
+query string and fragment are not part of the identity. Limits and timeouts
+resolve from ``Settings.target_overrides`` -- matched first on the exact
+endpoint key, then on the origin (``scheme://host:port`` or the legacy
+``host:port``) -- with ``target_default_*`` (which themselves default to the
+global values) as the final fallback. Without any target configuration,
+behavior is exactly the previous single global bulkhead.
 """
 
 from __future__ import annotations
@@ -40,7 +44,7 @@ from dataclasses import dataclass
 from typing import Self
 from urllib.parse import urlsplit
 
-from .config import Settings
+from .config import Settings, TargetRule
 from .state import open_db
 
 GLOBAL_SCOPE = "global"
@@ -50,12 +54,38 @@ _LEASE_MARGIN_SEC = 10.0
 
 
 def target_key(url: str) -> str:
-    """Stable identity of a downstream target: the URL authority (host:port)."""
+    """Stable identity of a downstream target.
+
+    The logical endpoint ``scheme://host:port/path``: downstreams that share an
+    origin (same domain + port) but live on different paths are isolated from
+    each other -- independent permits, deadlines and metrics. The query string
+    and fragment are deliberately excluded (same endpoint, different params).
+    Unparseable inputs collapse to ``"unknown"``.
+    """
     try:
-        netloc = urlsplit(url).netloc
+        parts = urlsplit(url)
     except ValueError:
-        netloc = ""
-    return netloc or "unknown"
+        return "unknown"
+    if not parts.netloc or not parts.scheme:
+        return "unknown"
+    path = parts.path or "/"
+    return f"{parts.scheme.lower()}://{parts.netloc}{path}"
+
+
+def origin_keys(url: str) -> tuple[str, ...]:
+    """Override-lookup keys for the endpoint's *origin*, most specific first.
+
+    Returns ``("scheme://host:port", "host:port")`` so both the new
+    scheme-qualified origin key and the legacy authority-only override key keep
+    working. Empty tuple for unparseable inputs.
+    """
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return ()
+    if not parts.netloc or not parts.scheme:
+        return ()
+    return (f"{parts.scheme.lower()}://{parts.netloc}", parts.netloc)
 
 
 @dataclass(frozen=True)
@@ -69,10 +99,18 @@ class TargetPolicy:
 
 def resolve_policy(settings: Settings, url: str) -> TargetPolicy:
     key = target_key(url)
-    rule = settings.target_overrides.get(key)
+    # Field-by-field resolution, most specific first: exact endpoint key, then
+    # the origin (scheme-qualified ``scheme://host:port``, then the legacy
+    # ``host:port`` form), finally the shared defaults. An endpoint override
+    # that sets only the capacity still inherits an origin-wide timeout.
     max_inflight = settings.target_default_max_inflight
     timeout_sec = settings.target_default_timeout_sec
-    if rule is not None:
+    candidates: list[TargetRule | None] = [settings.target_overrides.get(key)]
+    for origin in origin_keys(url):
+        candidates.append(settings.target_overrides.get(origin))
+    for rule in reversed(candidates):
+        if rule is None:
+            continue
         if rule.max_inflight is not None:
             max_inflight = rule.max_inflight
         if rule.timeout_sec is not None:

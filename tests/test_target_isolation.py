@@ -91,11 +91,14 @@ def _spawn_topology(server_factory, name, *, workers=1, slow_limit=SLOW_LIMIT,
                     global_limit=GLOBAL_LIMIT):
     dep_slow = server_factory(f"{name}-dep-slow")
     dep_fast = server_factory(f"{name}-dep-fast")
+    slow_endpoint = f"{dep_slow.base_url}/internal/deps/slow"
+    fast_endpoint = f"{dep_fast.base_url}/internal/deps/fast"
     overrides = {
-        f"127.0.0.1:{dep_slow.port}": {
+        # Endpoint-keyed override (path is part of the target identity).
+        slow_endpoint: {
             "max_inflight": slow_limit,
             "timeout_sec": SLOW_TIMEOUT,
-        }
+        },
     }
     main = server_factory(
         f"{name}-main",
@@ -108,12 +111,8 @@ def _spawn_topology(server_factory, name, *, workers=1, slow_limit=SLOW_LIMIT,
             "RATE_LIMIT_REFILL_PER_SEC": "1000000",
         },
     )
-    slow_url = _data_url(
-        main.base_url, f"{dep_slow.base_url}/internal/downstream?delay={SLOW_DELAY}"
-    )
-    fast_url = _data_url(
-        main.base_url, f"{dep_fast.base_url}/internal/downstream?delay={FAST_DELAY}"
-    )
+    slow_url = _data_url(main.base_url, f"{slow_endpoint}?delay={SLOW_DELAY}")
+    fast_url = _data_url(main.base_url, f"{fast_endpoint}?delay={FAST_DELAY}")
     return main, dep_slow, dep_fast, slow_url, fast_url
 
 
@@ -146,8 +145,8 @@ def test_slow_target_does_not_starve_fast_target(server_factory):
 
     # Per-target metrics: each target's concurrency outcome mix is visible.
     snap = httpx.get(f"{main.base_url}/metrics", timeout=5.0).json()
-    slow_key = f"127.0.0.1:{dep_slow.port}"
-    fast_key = f"127.0.0.1:{dep_fast.port}"
+    slow_key = f"{dep_slow.base_url}/internal/deps/slow"
+    fast_key = f"{dep_fast.base_url}/internal/deps/fast"
     print("\n[metrics.targets]", json.dumps(snap["targets"], indent=2, sort_keys=True))
     assert snap["targets"][slow_key]["timeout"]["count"] == slow_timeouts
     assert snap["targets"][slow_key]["target_rejected"]["count"] == slow_rejected
@@ -170,14 +169,27 @@ def test_target_results_are_distinguishable(server_factory):
         # target's own timeout (slow target, deadline 0.5s < delay 2s)
         r = client.get(slow_url)
         assert r.status_code == 504 and r.json()["outcome"] == "timeout"
-        # downstream actively returns an error -> downstream_error (502)
+        # downstream actively returns an error status -> downstream_error (502)
         r = client.get(_data_url(
-            base, f"{dep_fast.base_url}/internal/downstream?fail=true"))
-        assert r.status_code == 502 and r.json()["outcome"] == "internal_error"
-        assert r.json()["error"] == "downstream_error"
-        # connection failure (closed port) -> downstream_error (502), fast
+            base, f"{dep_fast.base_url}/internal/deps/fast?fail=true"))
+        body = r.json()
+        assert r.status_code == 502 and body["outcome"] == "downstream_error"
+        assert body["error"] == "downstream_error"
+        assert body["error_kind"] == "http_error_status"
+        assert body["downstream_status_code"] == 500
+        # connection failure (closed port) -> a DISTINCT 502, fast
         r = client.get(_data_url(base, "http://127.0.0.1:1/nope"))
-        assert r.status_code == 502 and r.json()["error"] == "downstream_error"
+        body = r.json()
+        assert r.status_code == 502
+        assert body["outcome"] == "downstream_unreachable"
+        assert body["error"] == "downstream_unreachable"
+        assert body["error_kind"] == "connection_refused"
+        assert body["latency_sec"] < 1.0
+        # ...and the two 502 bodies must never be confused
+        fail_body = client.get(_data_url(
+            base, f"{dep_fast.base_url}/internal/deps/fast?fail=true")).json()
+        assert fail_body["outcome"] != body["outcome"]
+        assert fail_body["error"] != body["error"]
 
     # target-level rejection: saturate the slow target, then one more.
     async def saturate():
@@ -193,7 +205,7 @@ def test_target_results_are_distinguishable(server_factory):
     assert len(rejected) >= 2, bodies
     for body in rejected:
         assert body["error"] == "target_bulkhead_rejected"
-        assert body["target"] == f"127.0.0.1:{dep_slow.port}"
+        assert body["target"] == f"{dep_slow.base_url}/internal/deps/slow"
     # ...and it differs from timeout / downstream_error / rate_limited bodies.
     assert {b["outcome"] for b in bodies} == {"timeout", "target_rejected"}
 

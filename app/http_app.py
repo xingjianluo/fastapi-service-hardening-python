@@ -14,12 +14,20 @@ Endpoints
 Failure semantics (distinct and machine-readable)
 -------------------------------------------------
 * 200 success
-* 429 ``rate_limited``       -- rejected by the cross-process token bucket
-* 503 ``bulkhead_rejected``  -- global in-flight gate saturated (all targets)
-* 503 ``target_rejected``    -- this target's own capacity share exhausted
-* 504 ``downstream_timeout`` -- downstream did not respond within the deadline
-* 502 ``downstream_error``   -- downstream connection/HTTP failure
-* 500 ``internal_error``     -- unexpected server-side error
+* 429 ``rate_limited``            -- rejected by the cross-process token bucket
+* 503 ``bulkhead_rejected``       -- global in-flight gate saturated (all targets)
+* 503 ``target_rejected``         -- this target's own capacity share exhausted
+* 504 ``timeout``                 -- downstream did not answer within the deadline
+* 502 ``downstream_error``        -- reached the downstream, it replied non-2xx
+* 502 ``downstream_unreachable``  -- no HTTP response obtainable (connection
+                                     refused / DNS failure / network down / reset)
+* 500 ``internal_error``          -- unexpected server-side error
+
+The two 502s share a status code by HTTP convention but are stable, distinct
+results: they differ in both ``outcome`` and ``error`` fields, plus a
+fine-grained ``error_kind`` (``connection_refused`` / ``dns_failure`` /
+``network_unreachable`` / ``connection_reset`` / ``protocol_error`` /
+``http_error_status`` / ...), so callers can branch on them mechanically.
 """
 
 from __future__ import annotations
@@ -91,6 +99,32 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             return JSONResponse(status_code=500, content={"error": "forced"})
         return {"slept": delay, "ts": time.time()}
 
+    @app.get("/internal/deps/{name}")
+    async def internal_named_dependency(
+        name: str,
+        delay: float = Query(0.0, ge=0.0, le=30.0),
+        fail: bool = False,
+        status_code: int = Query(200, ge=200, le=599),
+    ):
+        """Path-addressed built-in dependency for same-origin isolation tests.
+
+        Several *logical* downstreams can thus share one host/port while living
+        on different paths (``/internal/deps/slow`` vs
+        ``/internal/deps/fast``); the path is part of the target identity, so
+        they get independent bulkheads and deadlines. The query string only
+        steers behavior and is deliberately NOT part of the identity.
+        """
+        if delay:
+            await asyncio.sleep(delay)
+        if fail:
+            from fastapi.responses import JSONResponse
+
+            return JSONResponse(
+                status_code=status_code if status_code >= 400 else 500,
+                content={"error": "forced", "name": name, "slept": delay},
+            )
+        return {"name": name, "slept": delay, "ts": time.time()}
+
     def _call_naive(target: str) -> dict:
         # Pre-hardening behavior: a *blocking* call with no timeout and no
         # concurrency bound. It runs on a threadpool worker (sync endpoint),
@@ -118,10 +152,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         from fastapi.responses import JSONResponse
 
         started = time.perf_counter()
+        # Stash timing/attribution on the request so the global exception
+        # handler can attribute an unexpected error to the same target.
+        request.state.started = started
         target = target or _default_target(request)
         # Resolve the per-target policy (capacity + timeout) up front so every
         # outcome of this request is attributable to its downstream target.
         policy = resolve_policy(request.app.state.settings, target)
+        request.state.target_key = policy.key
 
         def finish(outcome: Outcome, status_code: int, body: dict) -> JSONResponse:
             latency = time.perf_counter() - started
@@ -168,8 +206,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
 
         # 3) Isolated downstream call with the target's own deadline. The
-        #    permit is released on every exit path (success, timeout, error,
-        #    cancellation), so capacity is recycled for the next request.
+        #    permit is released on every exit path (success, timeout, network
+        #    failure, downstream error, cancellation), so capacity is recycled
+        #    for the next request even under mid-flight client disconnects.
         client: DownstreamClient = request.app.state.downstream
         try:
             result = await client.call(target, timeout_sec=policy.timeout_sec)
@@ -182,15 +221,44 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             return finish(
                 Outcome.TIMEOUT,
                 504,
-                {"error": "downstream_timeout", "detail": result.detail},
+                {
+                    "error": "downstream_timeout",
+                    "detail": result.detail,
+                    "error_kind": result.error_kind,
+                },
+            )
+        if result.status == CallStatus.DOWNSTREAM_ERROR:
+            # Reached the downstream; its non-2xx reply is its own failure.
+            return finish(
+                Outcome.DOWNSTREAM_ERROR,
+                502,
+                {
+                    "error": "downstream_error",
+                    "detail": result.detail,
+                    "error_kind": result.error_kind,
+                    "downstream_status_code": result.status_code,
+                },
+            )
+        if result.status == CallStatus.UNREACHABLE:
+            # No HTTP response obtainable: refused port, DNS failure, network
+            # down, reset, ... -- deliberately distinct from a downstream
+            # error status and from the service's own internal errors.
+            return finish(
+                Outcome.DOWNSTREAM_UNREACHABLE,
+                502,
+                {
+                    "error": "downstream_unreachable",
+                    "detail": result.detail,
+                    "error_kind": result.error_kind,
+                },
             )
         return finish(
             Outcome.INTERNAL_ERROR,
-            502,
+            500,
             {
-                "error": "downstream_error",
+                "error": "internal_error",
                 "detail": result.detail,
-                "downstream_status_code": result.status_code,
+                "error_kind": result.error_kind,
             },
         )
 
@@ -202,16 +270,26 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def unhandled_exception_handler(request: Request, exc: Exception):
         from fastapi.responses import JSONResponse
 
-        # Internal errors are observable through the same outcome taxonomy.
+        # Internal errors are observable through the same outcome taxonomy and
+        # are attributed to their target whenever the request got far enough to
+        # resolve one.
         try:
             started = getattr(request.state, "started", None)
+            target_key = getattr(request.state, "target_key", None)
             latency = time.perf_counter() - started if started else 0.0
-            request.app.state.metrics.observe(Outcome.INTERNAL_ERROR.value, latency)
+            request.app.state.metrics.observe(
+                Outcome.INTERNAL_ERROR.value, latency, target_key
+            )
         except Exception:  # noqa: BLE001
             pass
         return JSONResponse(
             status_code=500,
-            content={"error": "internal_error", "detail": str(exc)},
+            content={
+                "error": "internal_error",
+                "detail": str(exc),
+                "outcome": Outcome.INTERNAL_ERROR.value,
+                "target": getattr(getattr(request, "state", None), "target_key", None),
+            },
         )
 
     return app

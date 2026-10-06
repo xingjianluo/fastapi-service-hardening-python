@@ -185,11 +185,12 @@ def server_factory(tmp_path: Path):
     logs_dir = PROJECT_ROOT / "logs"
     logs_dir.mkdir(exist_ok=True)
 
-    def _factory(name: str, *, workers: int = 1, env_extra: dict | None = None):
+    def _factory(name: str, *, workers: int = 1, env_extra: dict | None = None,
+                 port: int | None = None):
         db = tmp_path / f"{name}.db"
         log = logs_dir / f"test-{name}-{os.getpid()}.log"
         handle = spawn_server(
-            db, workers=workers, env_extra=env_extra, log_path=log
+            db, workers=workers, env_extra=env_extra, log_path=log, port=port
         )
         handles.append(handle)
         return handle

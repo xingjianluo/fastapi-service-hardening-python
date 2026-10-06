@@ -35,6 +35,8 @@ OUTCOMES: tuple[str, ...] = (
     "rate_limited",
     "bulkhead_rejected",
     "target_rejected",
+    "downstream_error",
+    "downstream_unreachable",
     "internal_error",
 )
 
@@ -307,13 +309,28 @@ class MetricsRecorder:
             total += count
         result["total"] = total
 
-        # Per-target breakdown (only targets with observations appear).
+        # Per-target breakdown. Every observed target always carries the FULL
+        # outcome taxonomy (zero-filled), so a target's success / timeout /
+        # rejection / failure counts are directly readable and comparable
+        # across targets and across deployments.
         targets: dict[str, dict] = {}
         for target, outcome, count, lsum, lmin, lmax in target_rows:
             count = int(count)
             if count <= 0:
                 continue
-            targets.setdefault(target, {})[outcome] = {
+            target_bucket = targets.setdefault(
+                target,
+                {
+                    name: {
+                        "count": 0,
+                        "latency_mean_sec": 0.0,
+                        "latency_min_sec": 0.0,
+                        "latency_max_sec": 0.0,
+                    }
+                    for name in OUTCOMES
+                },
+            )
+            target_bucket[outcome] = {
                 "count": count,
                 "latency_mean_sec": lsum / count,
                 "latency_min_sec": lmin,

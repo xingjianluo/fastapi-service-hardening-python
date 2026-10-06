@@ -21,7 +21,9 @@ def test_cold_start_metrics_have_stable_zero_shape(server_factory):
     server = server_factory("metrics-cold")
     snap = _metrics(server.base_url)
     print("\n[cold-start metrics keys]", sorted(snap.keys()))
-    for outcome in ("success", "timeout", "rate_limited", "bulkhead_rejected", "internal_error"):
+    for outcome in ("success", "timeout", "rate_limited", "bulkhead_rejected",
+                    "target_rejected", "downstream_error",
+                    "downstream_unreachable", "internal_error"):
         assert outcome in snap, outcome
         assert snap[outcome]["count"] == 0
         assert snap[outcome]["latency_mean_sec"] == 0.0
@@ -66,14 +68,14 @@ def test_each_outcome_is_distinctly_recorded(server_factory):
     assert s["latency_p99_sec"] >= s["latency_p50_sec"] >= 0
 
 
-def test_timeout_bulkhead_and_error_outcomes_are_separable(server_factory):
+def test_timeout_downstream_error_and_unreachable_are_separable(server_factory):
     server = server_factory(
         "metrics-failures",
         env_extra={
             "RATE_LIMIT_CAPACITY": "1000",
             "RATE_LIMIT_REFILL_PER_SEC": "1000",
             "DOWNSTREAM_TIMEOUT_SEC": "0.3",
-            "DOWNSTREAM_MAX_INFLIGHT": "1",
+            "DOWNSTREAM_MAX_INFLIGHT": "100",
         },
     )
     base = server.base_url
@@ -81,22 +83,50 @@ def test_timeout_bulkhead_and_error_outcomes_are_separable(server_factory):
         # downstream timeout: 504
         r = client.get(_data_url(base, delay=2))
         assert r.status_code == 504 and r.json()["outcome"] == "timeout"
-        # downstream error (HTTP 500 from dependency): 502
+        assert r.json()["error"] == "downstream_timeout"
+        # downstream actively returns an error status -> downstream_error (502)
         r = client.get(_data_url(base, fail="true"))
-        assert r.status_code == 502 and r.json()["outcome"] == "internal_error"
-        # connection error (unroutable closed port): fast 502
+        body = r.json()
+        assert r.status_code == 502 and body["outcome"] == "downstream_error"
+        assert body["error"] == "downstream_error"
+        assert body["error_kind"] == "http_error_status"
+        assert body["downstream_status_code"] == 500
+        # connection refused (nothing listening): a DISTINCT 502 outcome
         r = client.get(f"{base}/data?target=" + urllib.parse.quote(
             "http://127.0.0.1:1/nope", safe=""))
-        assert r.status_code == 502 and r.json()["outcome"] == "internal_error"
+        body = r.json()
+        assert r.status_code == 502
+        assert body["outcome"] == "downstream_unreachable"
+        assert body["error"] == "downstream_unreachable"
+        assert body["error_kind"] == "connection_refused"
 
     snap = _metrics(base)
-    print("\n[failure outcomes] timeout=%s internal_error=%s" % (
-        snap["timeout"]["count"], snap["internal_error"]["count"]))
+    print("\n[failure outcomes] timeout=%s downstream_error=%s "
+          "downstream_unreachable=%s" % (
+              snap["timeout"]["count"],
+              snap["downstream_error"]["count"],
+              snap["downstream_unreachable"]["count"]))
     assert snap["timeout"]["count"] == 1
-    assert snap["internal_error"]["count"] == 2
+    assert snap["downstream_error"]["count"] == 1
+    assert snap["downstream_unreachable"]["count"] == 1
+    assert snap["internal_error"]["count"] == 0
     assert snap["bulkhead_rejected"]["count"] == 0
     # timeout latency is bounded at the deadline, not the dependency delay
     assert snap["timeout"]["latency_max_sec"] < 0.6
+
+    # Per-target attribution: the two 502 kinds land under DIFFERENT targets.
+    targets = snap["targets"]
+    dep_target = f"{base.replace('http://', 'http://')}/internal/downstream"
+    assert targets[dep_target]["downstream_error"]["count"] == 1
+    assert targets["http://127.0.0.1:1/nope"][
+        "downstream_unreachable"]["count"] == 1
+    # every target carries the full zero-filled taxonomy
+    for bucket in targets.values():
+        assert set(bucket) == {
+            "success", "timeout", "rate_limited", "bulkhead_rejected",
+            "target_rejected", "downstream_error",
+            "downstream_unreachable", "internal_error",
+        }
 
 
 def test_metrics_aggregate_across_processes(server_factory):

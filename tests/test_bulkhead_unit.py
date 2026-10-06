@@ -19,9 +19,20 @@ def _policy(key: str, limit: int, timeout: float = 1.0) -> TargetPolicy:
     return TargetPolicy(key=key, max_inflight=limit, timeout_sec=timeout)
 
 
-def test_target_key_is_url_authority():
-    assert target_key("http://127.0.0.1:9001/a?b=c") == "127.0.0.1:9001"
-    assert target_key("https://example.com/x") == "example.com"
+def test_target_key_is_authority_plus_path():
+    # Path is part of the identity: same origin, different endpoints are
+    # different logical downstreams.
+    assert target_key("http://127.0.0.1:9001/a?b=c") == "127.0.0.1:9001/a"
+    assert target_key("http://127.0.0.1:9001/b") == "127.0.0.1:9001/b"
+    # Query strings never distinguish targets.
+    assert target_key("http://127.0.0.1:9001/a?x=1") == target_key(
+        "http://127.0.0.1:9001/a?x=2"
+    )
+    # Normalization: missing path == "/", trailing slash ignored.
+    assert target_key("http://127.0.0.1:9001") == "127.0.0.1:9001"
+    assert target_key("http://127.0.0.1:9001/") == "127.0.0.1:9001"
+    assert target_key("http://127.0.0.1:9001/a/") == "127.0.0.1:9001/a"
+    assert target_key("https://example.com/x") == "example.com/x"
     assert target_key("not a url") == "unknown"
 
 
@@ -33,15 +44,21 @@ def test_resolve_policy_prefers_override_then_default():
         db_path=":memory:", metrics_flush_interval_sec=1.0,
         target_overrides={
             "a:1": TargetRule(max_inflight=3, timeout_sec=0.25),
+            "a:1/slow": TargetRule(max_inflight=1, timeout_sec=None),
             "b:2": TargetRule(max_inflight=None, timeout_sec=0.5),
         },
     )
-    pa = resolve_policy(settings, "http://a:1/x")
-    assert (pa.key, pa.max_inflight, pa.timeout_sec) == ("a:1", 3, 0.25)
-    pb = resolve_policy(settings, "http://b:2/y")
-    assert (pb.max_inflight, pb.timeout_sec) == (7, 0.5)  # partial override
-    pc = resolve_policy(settings, "http://c:3/z")
-    assert (pc.max_inflight, pc.timeout_sec) == (7, 1.5)  # pure default
+    # Exact endpoint rule wins over the authority-wide one; partial fields
+    # fall back to the defaults.
+    pa = resolve_policy(settings, "http://a:1/slow?x=1")
+    assert (pa.key, pa.max_inflight, pa.timeout_sec) == ("a:1/slow", 1, 1.5)
+    # Authority-wide rule covers every other endpoint on that authority.
+    pb = resolve_policy(settings, "http://a:1/fast")
+    assert (pb.key, pb.max_inflight, pb.timeout_sec) == ("a:1/fast", 3, 0.25)
+    pc = resolve_policy(settings, "http://b:2/y")
+    assert (pc.max_inflight, pc.timeout_sec) == (7, 0.5)  # partial override
+    pd = resolve_policy(settings, "http://c:3/z")
+    assert (pd.max_inflight, pd.timeout_sec) == (7, 1.5)  # pure default
 
 
 def test_slow_target_cannot_consume_other_targets_share(tmp_path):

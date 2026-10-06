@@ -6,7 +6,7 @@ Every downstream call must hold **two** permits for its whole lifetime:
 
 * a **global** permit (scope ``global``) -- the final circuit breaker capping
   total in-flight downstream calls (``DOWNSTREAM_MAX_INFLIGHT``);
-* a **target** permit (scope ``target:<host:port>``) -- the per-downstream
+* a **target** permit (scope ``target:<host:port><path>``) -- the per-downstream
   bulkhead, so one slow target can only consume its own share and can never
   starve healthy targets.
 
@@ -21,11 +21,14 @@ explicitly in a ``finally`` (success, timeout, error *and* cancellation); a
 worker that dies anyway has its permits reclaimed lazily once the lease
 expires, so capacity cannot be stranded permanently.
 
-Target identity: the ``host:port`` authority of the downstream URL. Limits and
-timeouts resolve from ``Settings.target_overrides`` with
-``target_default_*`` (which themselves default to the global values) as
-fallback -- so without any target configuration, behavior is exactly the
-previous single global bulkhead.
+Target identity: the ``host:port`` authority **plus the URL path** of the
+downstream URL (query excluded), so logical downstreams that share an origin
+but expose different endpoints are isolated from each other. Limits and
+timeouts resolve from ``Settings.target_overrides`` (exact ``host:port/path``
+rule first, then the coarser ``host:port`` rule) with ``target_default_*``
+(which themselves default to the global values) as fallback -- so without any
+target configuration, behavior is exactly the previous single global
+bulkhead.
 """
 
 from __future__ import annotations
@@ -50,12 +53,37 @@ _LEASE_MARGIN_SEC = 10.0
 
 
 def target_key(url: str) -> str:
-    """Stable identity of a downstream target: the URL authority (host:port)."""
+    """Stable identity of a downstream target: authority + normalized path.
+
+    Several logical downstreams frequently share one ``host:port`` and differ
+    only by endpoint (path). Folding them into a single identity would let one
+    slow endpoint exhaust the shared share and starve the others, so the path
+    is part of the identity: ``http://h:1/api/slow`` and ``http://h:1/api/fast``
+    are *different* targets with independent capacity and timeout.
+
+    Normalization: the query string is excluded (it varies per call, not per
+    logical downstream); a missing path and ``/`` are the same target, in
+    which case the key is just the authority (backward compatible); a
+    trailing slash on longer paths is ignored (``/a`` == ``/a/``).
+    """
     try:
-        netloc = urlsplit(url).netloc
+        parts = urlsplit(url)
     except ValueError:
-        netloc = ""
-    return netloc or "unknown"
+        return "unknown"
+    authority = parts.netloc
+    if not authority:
+        return "unknown"
+    path = parts.path or "/"
+    if len(path) > 1:
+        path = path.rstrip("/")
+    if path == "/":
+        return authority
+    return f"{authority}{path}"
+
+
+def target_authority(key: str) -> str:
+    """The ``host:port`` prefix of a target key (its coarse-grained parent)."""
+    return key.split("/", 1)[0]
 
 
 @dataclass(frozen=True)
@@ -68,8 +96,19 @@ class TargetPolicy:
 
 
 def resolve_policy(settings: Settings, url: str) -> TargetPolicy:
+    """Resolve capacity/timeout for a target with hierarchical overrides.
+
+    Lookup order: exact ``host:port/path`` rule -> coarser ``host:port`` rule
+    -> ``target_default_*`` (which themselves default to the global values).
+    Thus an authority-wide rule still covers every endpoint on that authority,
+    and an endpoint-specific rule only carves out its own logical downstream.
+    """
     key = target_key(url)
     rule = settings.target_overrides.get(key)
+    if rule is None:
+        authority = target_authority(key)
+        if authority != key:
+            rule = settings.target_overrides.get(authority)
     max_inflight = settings.target_default_max_inflight
     timeout_sec = settings.target_default_timeout_sec
     if rule is not None:

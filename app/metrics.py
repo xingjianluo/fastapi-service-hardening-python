@@ -1,7 +1,8 @@
 """Request outcome/latency metrics, cross-process aggregated via SQLite.
 
 Every request is classified into exactly one outcome -- ``success``,
-``timeout``, ``rate_limited``, ``bulkhead_rejected`` or ``internal_error`` --
+``timeout``, ``rate_limited``, ``bulkhead_rejected``, ``target_rejected``,
+``connect_failed``, ``downstream_error`` or ``internal_error`` --
 and its wall latency recorded.
 
 Storage
@@ -35,6 +36,8 @@ OUTCOMES: tuple[str, ...] = (
     "rate_limited",
     "bulkhead_rejected",
     "target_rejected",
+    "connect_failed",
+    "downstream_error",
     "internal_error",
 )
 

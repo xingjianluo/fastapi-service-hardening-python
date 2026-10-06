@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import time
 
 # Token bucket state (single row per logical bucket).
 _SCHEMA_TOKENS = """
@@ -74,22 +75,39 @@ CREATE TABLE IF NOT EXISTS metrics_target (
 
 
 def open_db(db_path: str) -> sqlite3.Connection:
-    """Open (creating schema/directories as needed) a shared SQLite connection."""
+    """Open (creating schema/directories as needed) a shared SQLite connection.
+
+    Retries briefly on ``database is locked``: when several worker processes
+    start at once they all run the PRAGMA/schema bootstrap concurrently, and
+    the journal-mode switch can lose that race even with a busy timeout. The
+    whole bootstrap is idempotent, so retrying is safe.
+    """
     directory = os.path.dirname(os.path.abspath(db_path))
     os.makedirs(directory, exist_ok=True)
-    conn = sqlite3.connect(
-        db_path, timeout=5.0, isolation_level=None, check_same_thread=False
-    )
-    # Persistent DB-wide; cheap to (re)set on every connection.
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    conn.execute("PRAGMA busy_timeout=5000")
-    conn.execute(_SCHEMA_TOKENS)
-    conn.execute(_SCHEMA_METRICS)
-    conn.execute(_SCHEMA_METRICS_HIST)
-    conn.execute(_SCHEMA_INFLIGHT)
-    conn.execute(_SCHEMA_METRICS_TARGET)
-    return conn
+    last_exc: sqlite3.OperationalError | None = None
+    for _ in range(50):  # up to ~5s of contention at startup
+        conn = sqlite3.connect(
+            db_path, timeout=5.0, isolation_level=None, check_same_thread=False
+        )
+        try:
+            # Persistent DB-wide; cheap to (re)set on every connection.
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA busy_timeout=5000")
+            conn.execute(_SCHEMA_TOKENS)
+            conn.execute(_SCHEMA_METRICS)
+            conn.execute(_SCHEMA_METRICS_HIST)
+            conn.execute(_SCHEMA_INFLIGHT)
+            conn.execute(_SCHEMA_METRICS_TARGET)
+            return conn
+        except sqlite3.OperationalError as exc:
+            conn.close()
+            if "locked" in str(exc).lower():
+                last_exc = exc
+                time.sleep(0.1)
+                continue
+            raise
+    raise last_exc  # type: ignore[misc]
 
 
 def init_state(db_path: str) -> None:

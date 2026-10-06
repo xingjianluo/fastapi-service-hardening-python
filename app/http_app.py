@@ -14,12 +14,15 @@ Endpoints
 Failure semantics (distinct and machine-readable)
 -------------------------------------------------
 * 200 success
-* 429 ``rate_limited``       -- rejected by the cross-process token bucket
-* 503 ``bulkhead_rejected``  -- global in-flight gate saturated (all targets)
-* 503 ``target_rejected``    -- this target's own capacity share exhausted
-* 504 ``downstream_timeout`` -- downstream did not respond within the deadline
-* 502 ``downstream_error``   -- downstream connection/HTTP failure
-* 500 ``internal_error``     -- unexpected server-side error
+* 429 ``rate_limited``          -- rejected by the cross-process token bucket
+* 503 ``bulkhead_rejected``     -- global in-flight gate saturated (all targets)
+* 503 ``target_rejected``       -- this target's own capacity share exhausted
+* 504 ``downstream_timeout``    -- downstream did not respond within the deadline
+* 502 ``downstream_unreachable``-- transport failure: refused/DNS/unreachable
+  (the downstream never produced a response)
+* 502 ``downstream_error``      -- downstream actively returned an HTTP error
+  status (response body carries ``downstream_status_code``)
+* 500 ``internal_error``        -- unexpected server-side error
 """
 
 from __future__ import annotations
@@ -184,8 +187,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 504,
                 {"error": "downstream_timeout", "detail": result.detail},
             )
+        if result.status == CallStatus.UNREACHABLE:
+            # Transport-level failure (refused/DNS/unreachable/reset): the
+            # downstream never produced a response. Distinct, stable result --
+            # separable from the downstream actively returning an error.
+            return finish(
+                Outcome.CONNECT_FAILED,
+                502,
+                {"error": "downstream_unreachable", "detail": result.detail},
+            )
+        # The downstream WAS reached and actively returned an error status.
         return finish(
-            Outcome.INTERNAL_ERROR,
+            Outcome.DOWNSTREAM_ERROR,
             502,
             {
                 "error": "downstream_error",

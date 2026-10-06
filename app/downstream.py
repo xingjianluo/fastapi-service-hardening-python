@@ -10,6 +10,13 @@ global + per-target permits); this module only owns the HTTP exchange. The
 httpx pool is bounded by the global in-flight limit so a slow dependency
 cannot exhaust sockets, and responses are explicitly closed so connections
 are recycled for subsequent requests.
+
+Failure classification (stable, machine-distinguishable):
+
+* ``TIMEOUT``     -- the per-call deadline was exceeded;
+* ``UNREACHABLE`` -- transport-level failure, no HTTP response was obtained
+  (connection refused, DNS failure, network unreachable, reset, TLS...);
+* ``ERROR``       -- the downstream answered with an HTTP status >= 400.
 """
 
 from __future__ import annotations
@@ -25,6 +32,11 @@ class CallStatus(str, Enum):
     OK = "ok"
     TIMEOUT = "timeout"
     REJECTED = "rejected"  # kept for taxonomy compatibility
+    # Transport-level failure: no usable HTTP response was obtained from the
+    # downstream (connection refused, DNS resolution failure, network
+    # unreachable, connection reset, TLS/protocol errors).
+    UNREACHABLE = "unreachable"
+    # The downstream was reached and actively returned an HTTP error status.
     ERROR = "error"
 
 
@@ -96,5 +108,15 @@ class DownstreamClient:
         except asyncio.CancelledError:
             # Propagate cancellation; the caller's ``finally`` releases permits.
             raise
+        except httpx.TimeoutException as exc:
+            # Fallback: the asyncio deadline above is the authoritative timeout
+            # source, but if httpx's own budget ever fires first, classify it
+            # as a timeout (not a transport failure).
+            return CallResult(status=CallStatus.TIMEOUT, detail=str(exc))
         except httpx.HTTPError as exc:
-            return CallResult(status=CallStatus.ERROR, detail=str(exc))
+            # Transport-level failure (ConnectError/NetworkError/ProtocolError
+            # and friends): the downstream never produced an HTTP response.
+            # Kept strictly separate from ``ERROR`` (downstream answered with
+            # an error status) so callers can tell "network is broken" apart
+            # from "the downstream's business logic said no".
+            return CallResult(status=CallStatus.UNREACHABLE, detail=str(exc))

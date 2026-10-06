@@ -18,11 +18,10 @@ from __future__ import annotations
 
 import asyncio
 import json
-import time
 import urllib.parse
 
 import httpx
-from conftest import FloodResult, flood
+from conftest import flood, flood_mixed
 
 SLOW_DELAY = 2.0
 SLOW_TIMEOUT = 0.5
@@ -33,58 +32,6 @@ GLOBAL_LIMIT = 32
 
 def _data_url(base_url: str, dep_url: str) -> str:
     return f"{base_url}/data?target=" + urllib.parse.quote(dep_url, safe="")
-
-
-def _flood_mixed(title: str, groups: list[tuple[str, str, int]], timeout: float = 15.0):
-    """Fire several (label, url, count) groups concurrently; report per label."""
-
-    async def run():
-        per_label: dict[str, dict] = {
-            label: {"lat": [], "status": {}, "outcomes": {}}
-            for label, _, _ in groups
-        }
-
-        async def one(client: httpx.AsyncClient, label: str, url: str) -> None:
-            started = time.perf_counter()
-            try:
-                resp = await client.get(url)
-                dt = time.perf_counter() - started
-                code = resp.status_code
-                try:
-                    outcome = resp.json().get("outcome", "no_outcome")
-                except ValueError:
-                    outcome = "non_json"
-            except Exception as exc:  # noqa: BLE001
-                dt = time.perf_counter() - started
-                code = -1
-                outcome = f"client_error:{type(exc).__name__}"
-            bucket = per_label[label]
-            bucket["lat"].append(dt)
-            bucket["status"][code] = bucket["status"].get(code, 0) + 1
-            bucket["outcomes"][outcome] = bucket["outcomes"].get(outcome, 0) + 1
-
-        total = sum(count for _, _, count in groups)
-        limits = httpx.Limits(max_connections=total, max_keepalive_connections=total)
-        async with httpx.AsyncClient(timeout=timeout, limits=limits) as client:
-            await asyncio.gather(*(
-                one(client, label, url)
-                for label, url, count in groups
-                for _ in range(count)
-            ))
-        return per_label
-
-    started = time.perf_counter()
-    per_label = asyncio.run(run())
-    wall = time.perf_counter() - started
-    results = {}
-    for label, data in per_label.items():
-        res = FloodResult(
-            f"{title}/{label}", len(data["lat"]), wall,
-            data["status"], data["outcomes"], data["lat"],
-        )
-        res.report()
-        results[label] = res
-    return results
 
 
 def _spawn_topology(server_factory, name, *, workers=1, slow_limit=SLOW_LIMIT,
@@ -122,7 +69,7 @@ def test_slow_target_does_not_starve_fast_target(server_factory):
         server_factory, "isolation", global_limit=64
     )
     n_slow, n_fast = 32, 32
-    results = _flood_mixed(
+    results = flood_mixed(
         "isolation", [("slow", slow_url, n_slow), ("fast", fast_url, n_fast)]
     )
     slow, fast = results["slow"], results["fast"]
@@ -145,9 +92,10 @@ def test_slow_target_does_not_starve_fast_target(server_factory):
     assert -1 not in fast.status_counts and -1 not in slow.status_counts
 
     # Per-target metrics: each target's concurrency outcome mix is visible.
+    # Target identity is authority + path, so the keys include the endpoint.
     snap = httpx.get(f"{main.base_url}/metrics", timeout=5.0).json()
-    slow_key = f"127.0.0.1:{dep_slow.port}"
-    fast_key = f"127.0.0.1:{dep_fast.port}"
+    slow_key = f"127.0.0.1:{dep_slow.port}/internal/downstream"
+    fast_key = f"127.0.0.1:{dep_fast.port}/internal/downstream"
     print("\n[metrics.targets]", json.dumps(snap["targets"], indent=2, sort_keys=True))
     assert snap["targets"][slow_key]["timeout"]["count"] == slow_timeouts
     assert snap["targets"][slow_key]["target_rejected"]["count"] == slow_rejected
@@ -170,14 +118,18 @@ def test_target_results_are_distinguishable(server_factory):
         # target's own timeout (slow target, deadline 0.5s < delay 2s)
         r = client.get(slow_url)
         assert r.status_code == 504 and r.json()["outcome"] == "timeout"
-        # downstream actively returns an error -> downstream_error (502)
+        # downstream actively returns an error -> downstream_error (502),
+        # distinct from a transport-level failure
         r = client.get(_data_url(
             base, f"{dep_fast.base_url}/internal/downstream?fail=true"))
-        assert r.status_code == 502 and r.json()["outcome"] == "internal_error"
+        assert r.status_code == 502 and r.json()["outcome"] == "downstream_error"
         assert r.json()["error"] == "downstream_error"
-        # connection failure (closed port) -> downstream_error (502), fast
+        assert r.json()["downstream_status_code"] == 500
+        # connection failure (closed port) -> connect_failed (502), fast,
+        # and machine-distinguishable from the downstream's own error above
         r = client.get(_data_url(base, "http://127.0.0.1:1/nope"))
-        assert r.status_code == 502 and r.json()["error"] == "downstream_error"
+        assert r.status_code == 502 and r.json()["outcome"] == "connect_failed"
+        assert r.json()["error"] == "downstream_unreachable"
 
     # target-level rejection: saturate the slow target, then one more.
     async def saturate():
@@ -193,7 +145,7 @@ def test_target_results_are_distinguishable(server_factory):
     assert len(rejected) >= 2, bodies
     for body in rejected:
         assert body["error"] == "target_bulkhead_rejected"
-        assert body["target"] == f"127.0.0.1:{dep_slow.port}"
+        assert body["target"] == f"127.0.0.1:{dep_slow.port}/internal/downstream"
     # ...and it differs from timeout / downstream_error / rate_limited bodies.
     assert {b["outcome"] for b in bodies} == {"timeout", "target_rejected"}
 
@@ -204,7 +156,7 @@ def test_capacity_is_recycled_across_waves(server_factory):
     )
     waves = []
     for wave in range(3):
-        results = _flood_mixed(
+        results = flood_mixed(
             f"recycle-wave{wave}",
             [("slow", slow_url, 16), ("fast", fast_url, 16)],
         )

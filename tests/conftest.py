@@ -179,6 +179,60 @@ def flood(
     return result
 
 
+def flood_mixed(
+    title: str, groups: list[tuple[str, str, int]], timeout: float = 15.0
+) -> dict[str, FloodResult]:
+    """Fire several (label, url, count) groups concurrently; report per label."""
+
+    async def run():
+        per_label: dict[str, dict] = {
+            label: {"lat": [], "status": {}, "outcomes": {}}
+            for label, _, _ in groups
+        }
+
+        async def one(client: httpx.AsyncClient, label: str, url: str) -> None:
+            started = time.perf_counter()
+            try:
+                resp = await client.get(url)
+                dt = time.perf_counter() - started
+                code = resp.status_code
+                try:
+                    outcome = resp.json().get("outcome", "no_outcome")
+                except ValueError:
+                    outcome = "non_json"
+            except Exception as exc:  # noqa: BLE001
+                dt = time.perf_counter() - started
+                code = -1
+                outcome = f"client_error:{type(exc).__name__}"
+            bucket = per_label[label]
+            bucket["lat"].append(dt)
+            bucket["status"][code] = bucket["status"].get(code, 0) + 1
+            bucket["outcomes"][outcome] = bucket["outcomes"].get(outcome, 0) + 1
+
+        total = sum(count for _, _, count in groups)
+        limits = httpx.Limits(max_connections=total, max_keepalive_connections=total)
+        async with httpx.AsyncClient(timeout=timeout, limits=limits) as client:
+            await asyncio.gather(*(
+                one(client, label, url)
+                for label, url, count in groups
+                for _ in range(count)
+            ))
+        return per_label
+
+    started = time.perf_counter()
+    per_label = asyncio.run(run())
+    wall = time.perf_counter() - started
+    results = {}
+    for label, data in per_label.items():
+        res = FloodResult(
+            f"{title}/{label}", len(data["lat"]), wall,
+            data["status"], data["outcomes"], data["lat"],
+        )
+        res.report()
+        results[label] = res
+    return results
+
+
 @pytest.fixture
 def server_factory(tmp_path: Path):
     handles: list[ServerHandle] = []

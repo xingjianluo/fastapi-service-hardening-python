@@ -13,7 +13,7 @@ app/rate_limit.py      # 跨进程令牌桶（BEGIN IMMEDIATE 串行化）
 app/bulkhead.py        # 跨进程两级舱壁：全局总闸 + 按下游目标隔离（租约许可）
 app/downstream.py      # 带逐调用硬超时的下游 HTTP 调用（httpx 连接池）
 app/metrics.py         # 结果分类计数、时延统计、对数分桶 p50/p90/p99、按目标拆分
-app/outcomes.py        # 六类结果枚举
+app/outcomes.py        # 八类结果枚举
 app/http_app.py        # 装配、端点、失败语义与埋点
 tests/                 # 真实 uvicorn 子进程 + 并发洪泛 + 报告
 ```
@@ -54,49 +54,67 @@ uv run uvicorn main:app \
 
 对下游调用施加**两级舱壁 + 逐目标硬超时**：
 
-1. **目标级舱壁**：每个下游目标（以 URL 的 `host:port` 为身份）有独立的在途上限
-   `max_inflight`。慢目标只能占用自己的份额，份额用完后对该目标的请求**快速失败**为
-   **`503 target_rejected`**，不会排队、更不会挤占其它目标的容量——健康目标的成功率和
-   时延不受影响。
+1. **目标级舱壁**：每个下游目标有独立的在途上限 `max_inflight`。慢目标只能占用
+   自己的份额，份额用完后对该目标的请求**快速失败**为 **`503 target_rejected`**，
+   不会排队、更不会挤占其它目标的容量——健康目标的成功率和时延不受影响。
 2. **全局总闸**：所有目标共享全局在途上限 `DOWNSTREAM_MAX_INFLIGHT`，作为最终断路器。
    全局闸门耗尽时拒绝为 **`503 bulkhead_rejected`**（与目标级拒绝可区分）。
 3. **逐目标硬超时**：每个目标有独立的 `timeout_sec`，调用包裹 `asyncio.timeout`，
    超时转成 **`504 downstream_timeout`**，时延被钉死在该目标的超时阈值附近。
 
+**如何区分不同的下游目标**：目标身份 = URL 的 `host:port` **加上路径**（query 不参与，
+因为 query 逐请求变化而非逐逻辑下游变化）。因此共用同一域名/端口、只是路径不同的多个
+逻辑下游（如 `http://api.internal:8080/payment` 与 `http://api.internal:8080/search`）
+是**两个独立目标**，各自有独立的容量与超时，互不挤占。规范化规则：空路径与 `/` 相同
+（此时键就是 `host:port` 本身，与旧版兼容）；较长路径尾部的 `/` 忽略（`/a` 与 `/a/`
+是同一目标）。
+
 **跨进程一致性**：许可不是进程内信号量，而是共享 SQLite 中的 `inflight_permits` 行
-（scope = `global` 或 `target:<host:port>`）。获取在单个 `BEGIN IMMEDIATE` 事务内完成
+（scope = `global` 或 `target:<host:port><path>`）。获取在单个 `BEGIN IMMEDIATE` 事务内完成
 「清理过期租约 → 计数 → 插入」，因此多 worker 下目标级与全局在途数都**绝不超额**，
 也不存在按实例切分额度导致的「个别实例耗尽整体」问题。每个许可带租约
-（`timeout_sec + 10s`）：正常路径在 `finally`（含超时/取消/异常）中立即释放；持有者
-进程崩溃时，租约到期后被惰性回收，容量不会永久泄漏。连续多轮压力下各波次分布一致。
+（`timeout_sec + 10s`）：正常路径在 `finally`（含成功/超时/各类失败/取消）中立即释放；
+持有者进程崩溃时，租约到期后被惰性回收，容量不会永久泄漏。连续多轮压力下各波次分布一致。
 
 **目标配置语义**（运行时环境变量即可调整）：
 
 * 未配置任何目标规则时，目标级默认值回退到全局值，行为与上一版完全一致（兼容）。
 * `TARGET_DEFAULT_MAX_INFLIGHT` / `TARGET_DEFAULT_TIMEOUT_SEC`：所有未显式覆盖的
   目标共用的默认容量/超时。
-* `TARGET_OVERRIDES`：JSON 对象，按 `host:port` 覆盖，字段可只给其一，例如
-  `TARGET_OVERRIDES='{"127.0.0.1:9001": {"max_inflight": 4, "timeout_sec": 0.5}}'`。
+* `TARGET_OVERRIDES`：JSON 对象，按键覆盖，字段可只给其一。键支持两级，按
+  **精确路径规则 → 所属 authority 规则 → 默认值** 的顺序解析，例如
+  `TARGET_OVERRIDES='{"api.internal:8080/payment": {"max_inflight": 4, "timeout_sec": 0.5},
+  "api.internal:8080": {"max_inflight": 16}}'`——`/payment` 端点用自己的小份额，
+  该域名下其余端点共用 16 的份额。
 
 失败都是**明确、可区分、可观测**的结果，而不是挂起或静默降级：
 
-| HTTP | outcome | 触发条件 |
-| --- | --- | --- |
-| 200 | `success` | 下游 2xx |
-| 429 | `rate_limited` | 超出准入容量（未调用下游） |
-| 503 | `bulkhead_rejected` | **全局**在途闸门已满（所有目标共享的总闸） |
-| 503 | `target_rejected` | **该目标自身**容量份额耗尽（不影响其它目标） |
-| 504 | `timeout` | 下游超过该目标的截止时间 |
-| 502 | `internal_error` | 下游连接错误 / 非 2xx |
-| 500 | `internal_error` | 服务端未预期异常 |
+| HTTP | outcome | 响应体 `error` | 触发条件 |
+| --- | --- | --- | --- |
+| 200 | `success` | — | 下游 2xx |
+| 429 | `rate_limited` | `rate limit exceeded` | 超出准入容量（未调用下游） |
+| 503 | `bulkhead_rejected` | `bulkhead_rejected` | **全局**在途闸门已满（所有目标共享的总闸） |
+| 503 | `target_rejected` | `target_bulkhead_rejected` | **该目标自身**容量份额耗尽（不影响其它目标） |
+| 504 | `timeout` | `downstream_timeout` | 下游超过该目标的截止时间 |
+| 502 | `connect_failed` | `downstream_unreachable` | **传输层失败**：端口拒绝/网络不通/域名解析失败/连接重置等，下游根本没有给出响应 |
+| 502 | `downstream_error` | `downstream_error` | 下游**连得上**且主动返回了错误状态（≥400），响应体带 `downstream_status_code` |
+| 500 | `internal_error` | `internal_error` | 服务端自身的未预期异常 |
+
+**「网络断了」与「对方业务报错」的区分**：两类 502 的 `outcome`/`error` 字段稳定且互不
+相同——`connect_failed` 表示传输层根本没拿到下游的任何 HTTP 响应（连接被拒绝、DNS
+解析不了、网络不可达、TLS/协议错误等）；`downstream_error` 表示确实收到了下游的 HTTP
+响应、只是状态码是错误（此时 `downstream_status_code` 给出下游原始状态码）。两者又与
+目标自身超时（504 `timeout`）、容量占满被拒（503 两种）和服务自身内部异常（500
+`internal_error`）完全分开。
 
 两类 503 通过响应体的 `error`（`bulkhead_rejected` vs `target_bulkhead_rejected`）
-与 `outcome` 字段区分；每个 `/data` 响应还带 `target` 字段标明归属的下游目标。
+与 `outcome` 字段区分；每个 `/data` 响应还带 `target` 字段标明归属的下游目标
+（`host:port` + 路径）。
 
 ## 三、指标含义（Observability）
 
-每个请求按上述五类之一记录**端到端时延**，并周期性（`METRICS_FLUSH_INTERVAL_SEC`）
-把本进程增量以「加法 upsert」写入共享库，多 worker 自动聚合、无重复计数。
+每个请求按上述八类 outcome 之一记录**端到端时延**，并周期性（`METRICS_FLUSH_INTERVAL_SEC`）
+把本进程增量以「加法 upsert」写入共享库，多 worker 自动聚合、无重复计数、不串台。
 
 `GET /metrics` 对每个 outcome 返回：
 
@@ -106,11 +124,13 @@ uv run uvicorn main:app \
 * `latency_p50_sec` / `latency_p90_sec` / `latency_p99_sec`：由**对数等宽直方图**
   （1ms~60s，桶在各进程间可相加）估计，无需逐请求存行。
 
-另有顶层 `targets` 字段，按下游目标（`host:port`）拆分每个目标的 outcome 计数与
-`latency_mean/min/max`，可直接看出每个目标的并发规模、时延分布与拒绝计数。
+另有顶层 `targets` 字段，按下游目标（`host:port` + 路径，与响应中的 `target` 字段同源）
+拆分每个目标的 outcome 计数与 `latency_mean/min/max`，可直接看出每个目标的并发规模、
+时延分布与各类拒绝/失败计数；每个目标的成功、超时、被拒、连不上、下游报错都归到自己
+名下，多实例部署下语义一致，顶层 `total` 仍是所有目标之和（全局兜底口径）。
 
-**冷启动/预热语义一致**：计数从 0 开始；任何时刻快照都包含全部六个 outcome 且字段
-齐全（无观测时为 0），拒绝/超时与成功走同一条埋点路径，因此冷启动与稳态的数据形状
+**冷启动/预热语义一致**：计数从 0 开始；任何时刻快照都包含全部八个 outcome 且字段
+齐全（无观测时为 0），拒绝/超时/失败与成功走同一条埋点路径，因此冷启动与稳态的数据形状
 完全相同。
 
 ## 四、本地验证
@@ -137,31 +157,43 @@ uv run uvicorn main:app --workers 2 --port 8000
 # 24 个并发请求 → 恰好 12 个 200、12 个 429
 ```
 
-目标级隔离手动复现。目标身份是 URL 的 `host:port`，因此同一台服务器的
-`localhost:8000` 与 `127.0.0.1:8000` 就是**两个目标**：把 `localhost` 当慢目标
-（容量 2、超时 0.5s），`127.0.0.1` 当健康目标（用默认容量）：
+目标级隔离手动复现（**同一 host:port、不同路径**的两个逻辑下游）。目标身份是
+`host:port` + 路径，因此同一台服务器的 `/internal/downstream`（慢端点，容量 2、
+超时 0.5s）与 `/`（根路径，健康端点，用默认容量）就是**两个互不影响的目标**：
 
 ```bash
-TARGET_OVERRIDES='{"localhost:8000": {"max_inflight": 2, "timeout_sec": 0.5}}' \
+TARGET_OVERRIDES='{"127.0.0.1:8000/internal/downstream": {"max_inflight": 2, "timeout_sec": 0.5}}' \
 DOWNSTREAM_MAX_INFLIGHT=20 RATE_LIMIT_CAPACITY=100000 RATE_LIMIT_REFILL_PER_SEC=100000 \
 uv run uvicorn main:app --port 8000 &
 
-# 慢目标（delay=2s > 0.5s 超时）并发 8 个，压在后台
+# 慢端点（delay=2s > 0.5s 超时）并发 8 个，压在后台
 seq 8 | xargs -P8 -I{} curl -s -o /dev/null -w 'slow %{http_code}\n' \
-  'localhost:8000/data?target=http%3A%2F%2Flocalhost%3A8000%2Finternal%2Fdownstream%3Fdelay%3D2' | sort | uniq -c &
+  'localhost:8000/data?target=http%3A%2F%2F127.0.0.1%3A8000%2Finternal%2Fdownstream%3Fdelay%3D2' | sort | uniq -c &
 sleep 0.2
-# 同时打健康目标：全部 200，不被慢目标拖累
+# 同时打同一台服务器的根路径端点：全部 200，不被慢端点拖累
 seq 8 | xargs -P8 -I{} curl -s -o /dev/null -w 'fast %{http_code}\n' \
-  'localhost:8000/data?target=http%3A%2F%2F127.0.0.1%3A8000%2Finternal%2Fdownstream%3Fdelay%3D0.02' | sort | uniq -c
+  'localhost:8000/data?target=http%3A%2F%2F127.0.0.1%3A8000%2F' | sort | uniq -c
 wait
 # 输出：fast 8×200；slow 2×504（占满 2 个许可后超时）+ 6×503 target_rejected
 
-# 每个目标的并发结果、时延分布与拒绝计数
+# 每个目标的并发结果、时延分布与拒绝计数（两个目标键：带路径的慢端点 + 裸 authority 的根路径）
 curl -s localhost:8000/metrics | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)["targets"], indent=2))'
 ```
 
-注意：`TARGET_OVERRIDES` 的键必须与 `target` URL 的 authority **逐字符一致**
-（`localhost:8000` 与 `127.0.0.1:8000` 是两个不同目标）。
+失败分类手动复现（网络断 vs 下游业务报错 vs 超时）：
+
+```bash
+# 传输层失败（端口拒绝，立即返回）→ 502 connect_failed / downstream_unreachable
+curl -s 'localhost:8000/data?target=http%3A%2F%2F127.0.0.1%3A1%2Fnope'
+# 下游连得上、主动返回错误状态 → 502 downstream_error（带 downstream_status_code=500）
+curl -s 'localhost:8000/data?target=http%3A%2F%2F127.0.0.1%3A8000%2Finternal%2Fdownstream%3Ffail%3Dtrue'
+# 下游超时 → 504 timeout / downstream_timeout
+curl -s 'localhost:8000/data?target=http%3A%2F%2F127.0.0.1%3A8000%2Finternal%2Fdownstream%3Fdelay%3D5'
+```
+
+注意：`TARGET_OVERRIDES` 的键必须与目标身份**逐字符一致**——精确路径规则
+（`host:port/path`）只作用于该端点；authority 规则（`host:port`）作用于该域名端口下
+未单独覆盖的所有端点；`localhost:8000` 与 `127.0.0.1:8000` 仍是两个不同目标。
 
 ### 自动化测试
 
@@ -177,14 +209,22 @@ uv run pytest -s            # -s 查看每次洪泛打印的并发规模/时延�
   **端到端吞吐提升 ≥ 3×**（实测约 6×），重复波次分布一致以证明资源被回收。
 * **限流** `test_rate_limit.py`：突发精确接纳/拒绝、持续低速零误伤、令牌恢复、
   以及 **2 worker 共享桶不超发**。
-* **观测** `test_metrics_and_observability.py`：冷启动零值形状稳定、六种 outcome
-  可区分、p50/p90/p99 时延统计、跨进程计数聚合。
+* **观测** `test_metrics_and_observability.py`：冷启动零值形状稳定、八种 outcome
+  可区分（含 `connect_failed` 与 `downstream_error` 的分离）、p50/p90/p99 时延统计、
+  跨进程计数聚合。
 * **目标级隔离** `test_target_isolation.py`：两个独立下游目标（两个依赖子进程，
   一慢 2s 一快 20ms）并发施压。验证慢目标只占自己的 4 个许可（4×504 + 28×
   `target_rejected`），快目标 32/32 全部成功且 p99 远低于慢目标超时；目标级拒绝与
-  超时/下游错误/连接失败/内部异常逐一可区分；连续 3 波分布无漂移（许可回收）；
+  超时/下游主动报错/网络连不上/内部异常逐一可区分；连续 3 波分布无漂移（许可回收）；
   2 worker 下目标级与全局限额共同精确生效；`/metrics` 的 `targets` 拆分与之一致。
-* **舱壁单元** `test_bulkhead_unit.py`：目标身份解析、覆盖项优先级、目标间隔离、
+* **逻辑下游（同源不同路径）** `test_logical_downstreams.py`：**同一台**依赖服务器的两个
+  端点（慢 `/internal/downstream` + 快 `/`）并发隔离——慢端点只占自己的 2 个许可，
+  快端点 16/16 全部成功；`connect_failed`（拒绝端口）与 `downstream_error`（下游
+  主动 500）稳定可区分且与超时/拒绝/内部异常分开；混合失败（成功+超时+拒绝+连不上）
+  连续 3 波分布无漂移、各目标计数精确归位、全局总量为各目标之和。全部离线可跑，
+  不依赖调度时序（计数断言带 ±1 容差）。
+* **舱壁单元** `test_bulkhead_unit.py`：目标身份解析（authority+路径、query 不参与、
+  尾斜杠归一）、覆盖项分级优先级（精确路径 → authority → 默认）、目标间隔离、
   全局总闸、许可回收复用、并发不超发、崩溃持有者租约到期回收。
 
 每个洪泛用例都会打印，例如：
@@ -206,17 +246,23 @@ uv run pytest -s            # -s 查看每次洪泛打印的并发规模/时延�
 | `DOWNSTREAM_MAX_INFLIGHT` | 20 | 全局在途下游调用上限（跨进程总闸/连接池） |
 | `TARGET_DEFAULT_MAX_INFLIGHT` | 同全局值 | 未覆盖目标的默认在途上限 |
 | `TARGET_DEFAULT_TIMEOUT_SEC` | 同全局值 | 未覆盖目标的默认超时（秒） |
-| `TARGET_OVERRIDES` | 空 | JSON：`{"host:port": {"max_inflight": N, "timeout_sec": S}}` |
+| `TARGET_OVERRIDES` | 空 | JSON：`{"host:port[/path]": {"max_inflight": N, "timeout_sec": S}}`，精确路径规则优先于 authority 规则 |
 | `SERVICE_DB_PATH` | `.state/service.db` | 跨进程共享 SQLite 路径 |
 | `METRICS_FLUSH_INTERVAL_SEC` | 1.0 | 指标增量落库周期（秒） |
 
 ## 六、多进程边界与兼容范围
 
-* **一致语义**：限流令牌桶、目标级/全局在途许可、失败计数全部落在共享 SQLite，
-  请求落到哪个 worker 都不改变判定结果；全局上限始终是最终总闸。
+* **一致语义**：限流令牌桶、目标级/全局在途许可、按目标拆分的各类失败计数全部落在
+  共享 SQLite，请求落到哪个 worker 都不改变判定结果、计数也不串台；全局上限始终是
+  最终总闸。
 * **租约边界**：许可租约为 `目标超时 + 10s`。worker 崩溃后其许可最多占用一个租约
-  周期即被回收；这是崩溃恢复的唯一时间边界，正常路径不受影响。
-* **兼容范围**：`GET /` 与成功响应结构不变；原有五类 outcome、状态码与跨进程聚合
-  行为保持；新增 `target_rejected` outcome、`targets` 指标拆分与响应中的 `target`
-  字段均为纯增量。未配置任何 `TARGET_*` 变量时，目标级默认值回退到全局值，行为与
-  上一版逐项一致（既有测试全部原样通过）。
+  周期即被回收；这是崩溃恢复的唯一时间边界，正常路径（含成功、各类失败与中途取消）
+  都在 `finally` 中立即归还许可。
+* **兼容范围**：`GET /` 与成功响应结构不变；`success`/`timeout`/`rate_limited`/
+  `bulkhead_rejected`/`target_rejected` 五类 outcome 的状态码与语义保持。失败分类在本版
+  被**细化**：原先并入 `internal_error`（502）的「下游连接失败」与「下游返回错误状态」
+  现在分别是独立的 `connect_failed` 与 `downstream_error` outcome，`internal_error`
+  只保留给服务端自身的未预期异常（500）；目标身份从纯 `host:port` 扩展为
+  `host:port` + 路径，`/metrics` 的 `targets` 键与响应的 `target` 字段相应带上了路径
+  （根路径目标仍是裸 `host:port`，与旧键一致）。未配置任何 `TARGET_*` 变量时，目标级
+  默认值回退到全局值，容量/超时行为与上一版逐项一致。

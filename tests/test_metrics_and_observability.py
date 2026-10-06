@@ -21,7 +21,9 @@ def test_cold_start_metrics_have_stable_zero_shape(server_factory):
     server = server_factory("metrics-cold")
     snap = _metrics(server.base_url)
     print("\n[cold-start metrics keys]", sorted(snap.keys()))
-    for outcome in ("success", "timeout", "rate_limited", "bulkhead_rejected", "internal_error"):
+    for outcome in ("success", "timeout", "rate_limited", "bulkhead_rejected",
+                    "target_rejected", "connect_failed", "downstream_error",
+                    "internal_error"):
         assert outcome in snap, outcome
         assert snap[outcome]["count"] == 0
         assert snap[outcome]["latency_mean_sec"] == 0.0
@@ -81,19 +83,26 @@ def test_timeout_bulkhead_and_error_outcomes_are_separable(server_factory):
         # downstream timeout: 504
         r = client.get(_data_url(base, delay=2))
         assert r.status_code == 504 and r.json()["outcome"] == "timeout"
-        # downstream error (HTTP 500 from dependency): 502
+        # downstream actively returns an error status: 502 downstream_error
         r = client.get(_data_url(base, fail="true"))
-        assert r.status_code == 502 and r.json()["outcome"] == "internal_error"
-        # connection error (unroutable closed port): fast 502
+        assert r.status_code == 502 and r.json()["outcome"] == "downstream_error"
+        assert r.json()["error"] == "downstream_error"
+        assert r.json()["downstream_status_code"] == 500
+        # transport failure (closed port): 502 connect_failed, fast, and
+        # clearly distinct from the downstream's own error status above
         r = client.get(f"{base}/data?target=" + urllib.parse.quote(
             "http://127.0.0.1:1/nope", safe=""))
-        assert r.status_code == 502 and r.json()["outcome"] == "internal_error"
+        assert r.status_code == 502 and r.json()["outcome"] == "connect_failed"
+        assert r.json()["error"] == "downstream_unreachable"
 
     snap = _metrics(base)
-    print("\n[failure outcomes] timeout=%s internal_error=%s" % (
-        snap["timeout"]["count"], snap["internal_error"]["count"]))
+    print("\n[failure outcomes] timeout=%s downstream_error=%s connect_failed=%s" % (
+        snap["timeout"]["count"], snap["downstream_error"]["count"],
+        snap["connect_failed"]["count"]))
     assert snap["timeout"]["count"] == 1
-    assert snap["internal_error"]["count"] == 2
+    assert snap["downstream_error"]["count"] == 1
+    assert snap["connect_failed"]["count"] == 1
+    assert snap["internal_error"]["count"] == 0
     assert snap["bulkhead_rejected"]["count"] == 0
     # timeout latency is bounded at the deadline, not the dependency delay
     assert snap["timeout"]["latency_max_sec"] < 0.6
